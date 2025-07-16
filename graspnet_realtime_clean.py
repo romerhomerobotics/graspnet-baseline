@@ -25,7 +25,9 @@ parser.add_argument('--num_view', type=int, default=300, help='Number of views')
 parser.add_argument('--collision_thresh', type=float, default=0.01, help='Collision threshold')
 parser.add_argument('--voxel_size', type=float, default=0.01, help='Voxel size')
 cfgs = parser.parse_args()
+
 from graspnet_realtime import get_grasps
+
 
 def get_net():
     net = GraspNet(
@@ -106,6 +108,20 @@ def main():
             cloud_masked = cloud[mask]
             color_masked = color_image[mask]
 
+            # Convert to Open3D point cloud
+            pcd_raw = o3d.geometry.PointCloud()
+            pcd_raw.points = o3d.utility.Vector3dVector(cloud_masked)
+            pcd_raw.colors = o3d.utility.Vector3dVector(color_masked)
+
+            # Remove radius outliers
+            pcd_clean, ind = pcd_raw.remove_radius_outlier(nb_points=10, radius=0.02)
+
+            # Convert back to numpy
+            cloud_masked = np.asarray(pcd_clean.points)
+            color_masked = np.asarray(pcd_clean.colors)
+
+            print(f"After outlier removal: {len(cloud_masked)} points")
+
             # Random sampling
             if len(cloud_masked) >= cfgs.num_point:
                 idxs = np.random.choice(len(cloud_masked), cfgs.num_point, replace=False)
@@ -127,9 +143,24 @@ def main():
                 collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=cfgs.collision_thresh)
                 gg = gg[~collision_mask]
 
+            # NMS and sort
             gg.nms()
             gg.sort_by_score()
-            gg = gg[:50]
+
+            # Print the highest-scoring grasp
+            if len(gg) > 0:
+                best_grasp = gg[0]
+                print("Best Grasp Prediction:")
+                print(" Translation (x,y,z):", best_grasp.translation)
+                print(" Rotation Matrix:\n", best_grasp.rotation_matrix)
+                print(" Width:", best_grasp.width)
+                print(" Score:", best_grasp.score)
+
+                # Keep top N for visualization
+                gg = gg[:20]
+            else:
+                print("No grasps found.")
+                gg = GraspGroup()
 
             # Open3D visualization
             pcd.points = o3d.utility.Vector3dVector(cloud_masked)
@@ -145,15 +176,8 @@ def main():
                     vis.add_geometry(g)
             vis.poll_events()
             vis.update_renderer()
-
-            # OpenCV visualization
-            depth_colormap = cv2.applyColorMap(
-                cv2.convertScaleAbs(depth_image, alpha=0.03),
-                cv2.COLORMAP_JET
-            )
-            color_image_bgr = (color_image * 255).astype(np.uint8)[:, :, ::-1]
-            cv2.imshow("RGB", color_image_bgr)
-            cv2.imshow("Depth", depth_colormap)
+            view_ctl = vis.get_view_control()
+            view_ctl.set_zoom(0.4)
 
             if cv2.waitKey(1) == 27:
                 break
