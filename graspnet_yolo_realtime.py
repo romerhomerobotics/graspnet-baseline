@@ -55,9 +55,6 @@ def get_grasps(net, end_points):
     return gg
 
 def main():
-    # Load GraspNet
-    net = get_net()
-
     # Load YOLOv8
     yolo_model = YOLO("yolov8n.pt")
 
@@ -69,14 +66,22 @@ def main():
     align = rs.align(rs.stream.color)
     pipeline.start(config)
 
+    # Create Open3D Visualizer
     vis = o3d.visualization.Visualizer()
-    vis.create_window(window_name="GraspNet PointCloud", width=1280, height=720)
+    vis.create_window(window_name="RealSense PointCloud", width=1280, height=720)
     pcd = o3d.geometry.PointCloud()
     added = False
 
     print("Press ESC to stop.")
 
     try:
+        # Filters
+        decimation = rs.decimation_filter()
+        spatial = rs.spatial_filter()
+        temporal = rs.temporal_filter()
+        hole_filling = rs.hole_filling_filter()
+        pc = rs.pointcloud()
+
         while True:
             frames = pipeline.wait_for_frames()
             frames = align.process(frames)
@@ -86,119 +91,71 @@ def main():
             if not depth_frame or not color_frame:
                 continue
 
-            # Convert to numpy
-            depth_image = np.asanyarray(depth_frame.get_data())
-            color_image = np.asanyarray(color_frame.get_data()).astype(np.float32) / 255.0
-            color_image_bgr = cv2.cvtColor((color_image * 255).astype(np.uint8), cv2.COLOR_RGB2BGR).copy()
+            # Apply filters
+            depth_frame = decimation.process(depth_frame)
+            depth_frame = spatial.process(depth_frame)
+            depth_frame = temporal.process(depth_frame)
+            depth_frame = hole_filling.process(depth_frame)
 
-            # YOLO detection
-            yolo_results = yolo_model.predict(color_image_bgr, verbose=False)
+            # Generate point cloud
+            pc.map_to(color_frame)
+            points = pc.calculate(depth_frame)
 
-            # Gather bounding boxes
-            bboxes = []
-            for box in yolo_results[0].boxes:
-                xyxy = box.xyxy[0].cpu().numpy()
-                x1, y1, x2, y2 = map(int, xyxy)
-                bboxes.append((x1, y1, x2, y2))
+            # Convert RealSense frame to numpy BGR for YOLO visualization
+            color_image_bgr = np.asanyarray(color_frame.get_data())
 
-            # Intrinsics
-            intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
-            camera = CameraInfo(
-                width=depth_image.shape[1],
-                height=depth_image.shape[0],
-                fx=intrinsics.fx,
-                fy=intrinsics.fy,
-                cx=intrinsics.ppx,
-                cy=intrinsics.ppy,
-                scale=1000.0
-            )
+            # Convert BGR to RGB for mapping point cloud colors
+            color_image_rgb = cv2.cvtColor(color_image_bgr, cv2.COLOR_BGR2RGB)
 
-            # Point cloud
-            cloud = create_point_cloud_from_depth_image(depth_image, camera, organized=True)
-            mask = (depth_image > 0) & (depth_image < 1500)
-            cloud_masked = cloud[mask]
-            color_masked = color_image[mask]
+            # Mask invalid depths
+            vtx = np.asanyarray(points.get_vertices()).view(np.float32).reshape(-1, 3)
+            tex = np.asanyarray(points.get_texture_coordinates()).view(np.float32).reshape(-1, 2)
+            valid_mask = (vtx[:, 2] > 0) & (vtx[:, 2] < 1.5)
+            vtx = vtx[valid_mask]
+            tex = tex[valid_mask]
 
-            # Random sampling
-            if len(cloud_masked) >= cfgs.num_point:
-                idxs = np.random.choice(len(cloud_masked), cfgs.num_point, replace=False)
-            else:
-                idxs1 = np.arange(len(cloud_masked))
-                idxs2 = np.random.choice(len(cloud_masked), cfgs.num_point - len(cloud_masked), replace=True)
-                idxs = np.concatenate([idxs1, idxs2], axis=0)
-            cloud_sampled = cloud_masked[idxs]
-            color_sampled = color_masked[idxs]
+            # Map texture coordinates to RGB colors
+            colors = []
+            for u, v in tex:
+                x = min(max(int(u * color_image_rgb.shape[1]), 0), color_image_rgb.shape[1] - 1)
+                y = min(max(int(v * color_image_rgb.shape[0]), 0), color_image_rgb.shape[0] - 1)
+                colors.append(color_image_rgb[y, x] / 255.0)
+            colors = np.asarray(colors)
 
-            # Prepare tensor
-            cloud_tensor = torch.from_numpy(cloud_sampled[np.newaxis].astype(np.float32)).to("cuda:0" if torch.cuda.is_available() else "cpu")
-            end_points = {'point_clouds': cloud_tensor, 'cloud_colors': color_sampled}
+            # Update point cloud
+            pcd.points = o3d.utility.Vector3dVector(vtx)
+            pcd.colors = o3d.utility.Vector3dVector(colors)
 
-            # Grasp prediction
-            gg = get_grasps(net, end_points)
-            if cfgs.collision_thresh > 0:
-                mfcdetector = ModelFreeCollisionDetector(np.asarray(cloud_masked), voxel_size=cfgs.voxel_size)
-                collision_mask = mfcdetector.detect(gg, approach_dist=0.05, collision_thresh=cfgs.collision_thresh)
-                gg = gg[~collision_mask]
-
-            # Project grasp translations to image and filter
-            keep_indices = []
-            for idx, grasp in enumerate(gg):
-                X, Y, Z = grasp.translation
-                if Z <= 0:
-                    continue
-                u = intrinsics.fx * X / Z + intrinsics.ppx
-                v = intrinsics.fy * Y / Z + intrinsics.ppy
-                u, v = int(round(u)), int(round(v))
-
-                in_any_box = False
-                for (x1, y1, x2, y2) in bboxes:
-                    if x1 <= u <= x2 and y1 <= v <= y2:
-                        in_any_box = True
-                        break
-
-                if in_any_box:
-                    keep_indices.append(idx)
-
-            # Convert back to GraspGroup
-            if len(keep_indices) > 0:
-                gg_filtered = gg[keep_indices]
-            else:
-                print("No grasps in bounding boxes. Skipping visualization.")
-                continue
-
-            if len(gg_filtered) == 0:
-                print("No grasps in bounding boxes. Skipping visualization.")
-                continue
-
-            gg_filtered.nms()
-            gg_filtered.sort_by_score()
-            best_grasp = gg_filtered[0]
-            print("Best Grasp Prediction:")
-            print(" Translation (x,y,z):", best_grasp.translation)
-            print(" Score:", best_grasp.score)
-
-            gg_vis = gg_filtered[:20]
-
-            # Open3D visualization
-            pcd.points = o3d.utility.Vector3dVector(cloud_masked)
-            pcd.colors = o3d.utility.Vector3dVector(color_masked)
-            geometries = [pcd] + gg_vis.to_open3d_geometry_list()
             if not added:
-                for g in geometries:
-                    vis.add_geometry(g)
+                vis.add_geometry(pcd)
                 added = True
-            else:
-                vis.clear_geometries()
-                for g in geometries:
-                    vis.add_geometry(g)
+
+            vis.update_geometry(pcd)
             vis.poll_events()
             vis.update_renderer()
 
-            # OpenCV visualization with YOLO boxes
-            for (x1, y1, x2, y2) in bboxes:
-                cv2.rectangle(color_image_bgr, (x1, y1), (x2, y2), (0, 255, 0), 2)
-            cv2.imshow("RGB with YOLO Boxes", color_image_bgr)
+            # --- YOLO detection and visualization ---
+            # Run YOLO on the *original BGR image* (so it looks normal in OpenCV)
+            results = yolo_model.predict(color_image_bgr, verbose=False)
 
+            # Draw detections
+            vis_image = color_image_bgr.copy()
+            for box in results[0].boxes:
+                cls = int(box.cls[0])
+                conf = float(box.conf[0])
+                xyxy = box.xyxy[0].cpu().numpy()
+                label = yolo_model.names[cls]
+
+                x1, y1, x2, y2 = map(int, xyxy)
+                cv2.rectangle(vis_image, (x1, y1), (x2, y2), (0, 255, 0), 2)
+                text = f"{label} {conf:.2f}"
+                cv2.putText(vis_image, text, (x1, y1 - 5),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+
+            # Show YOLO RGB window
+            cv2.imshow("YOLOv8 RGB", vis_image)
+
+            # Exit on ESC
             if cv2.waitKey(1) == 27:
                 break
 
