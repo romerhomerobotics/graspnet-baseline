@@ -132,8 +132,17 @@ def visualize(gg, cloud_masked, color_masked):
     gg.nms()
     gg.sort_by_score()
     gg = gg[:50]
-    grippers = gg.to_open3d_geometry_list()
+
+    def score_to_color(score):
+        return (1 - score, 0, score)
+
+    grippers = []
+    for grasp in gg:
+        color = score_to_color(grasp.score)
+        grippers.append(grasp.to_open3d_geometry(color=color))  # ← FIXED
+
     o3d.visualization.draw_geometries([cloud, *grippers])
+
 
 # --- Run full demo ---
 if __name__ == '__main__':

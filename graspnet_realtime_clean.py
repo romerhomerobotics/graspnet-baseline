@@ -77,7 +77,7 @@ def main():
             frames = align.process(frames)
 
             depth_frame = frames.get_depth_frame()
-            color_frame = frames.get_color_frame()
+            color_frame = frames.get_color_frame()                
             if not depth_frame or not color_frame:
                 continue
 
@@ -89,6 +89,8 @@ def main():
             # Depth and color arrays
             depth_image = np.asanyarray(depth_frame.get_data())
             color_image = np.asanyarray(color_frame.get_data()).astype(np.float32) / 255.0
+            # Turn BGR to RGB
+            #color_image = color_image[:, :, ::-1]
 
             # Intrinsics
             intrinsics = depth_frame.profile.as_video_stream_profile().intrinsics
@@ -113,12 +115,10 @@ def main():
             pcd_raw.points = o3d.utility.Vector3dVector(cloud_masked)
             pcd_raw.colors = o3d.utility.Vector3dVector(color_masked)
 
-            # Remove radius outliers
-            pcd_clean, ind = pcd_raw.remove_radius_outlier(nb_points=10, radius=0.02)
 
             # Convert back to numpy
-            cloud_masked = np.asarray(pcd_clean.points)
-            color_masked = np.asarray(pcd_clean.colors)
+            cloud_masked = np.asarray(pcd_raw.points)
+            color_masked = np.asarray(pcd_raw.colors)
 
             print(f"After outlier removal: {len(cloud_masked)} points")
 
